@@ -31,7 +31,7 @@ class Keitaro:
             except ValueError:
                 detail = response.text[:300]
             raise HTTPException(response.status_code if response.status_code < 500 else 502, {"keitaro": detail})
-        return response.json()
+        return response.json() if response.content else {}
 
     async def get(self, path: str, **kwargs):
         return await self.request("GET", path, **kwargs)

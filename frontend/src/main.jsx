@@ -28,7 +28,7 @@ function Select({ label, value, onChange, items }) {
 
 function App() {
   const [tab, setTab] = useState('create')
-  const [options, setOptions] = useState({ domains: [], groups: [], sources: [], offers: [] })
+  const [options, setOptions] = useState({ domains: [], groups: [], sources: [], offers: [], deleted_offers: [] })
   const [campaigns, setCampaigns] = useState([])
   const [form, setForm] = useState(initial)
   const [selected, setSelected] = useState('')
@@ -48,7 +48,7 @@ function App() {
     window.addEventListener('beforeunload', warnOnLeave)
     return () => window.removeEventListener('beforeunload', warnOnLeave)
   }, [hasChanges])
-  const offerName = id => options.offers.find(offer => offer.id === id)?.name || `Оффер #${id}`
+  const offerName = id => [...options.offers, ...options.deleted_offers].find(offer => offer.id === id)?.name || `Оффер #${id}`
   const setField = (key, value) => setForm(previous => ({ ...previous, [key]: value }))
 
   const load = async () => {
@@ -102,7 +102,9 @@ function App() {
     try {
       const updated = editOffers(stream, original, offerId, action)
       setDraftStreams(previous => previous.map(item => item.id === streamId ? updated : item))
-      setError(''); setNotice('')
+      setError('')
+      const archived = stream.offers?.find(item => item.offer_id === Number(offerId))?.archived_in_keitaro
+      setNotice(action === 'restore' && archived ? 'Оффер будет восстановлен из архива Keitaro после отправки изменений.' : '')
       if (action === 'add') setOfferChoice(previous => ({ ...previous, [streamId]: '' }))
     } catch (err) { setError(err.message) }
   }
@@ -233,7 +235,7 @@ function App() {
               {(stream.offers || []).map(item => <div className={'offer-row ' + (item.state !== 'active' ? 'muted' : '')} key={item.offer_id}>
                 <div><b>{offerName(item.offer_id)}</b><small>#{item.offer_id}</small></div>
                 <div className="share"><div className="bar"><i style={{ width: item.share + '%' }}/></div><b>{item.share}%</b></div>
-                <span className={'state ' + (item.state === 'active' ? 'on' : '')}>{item.state === 'active' ? 'Активен' : 'Удалён'}</span>
+                <span className={'state ' + (item.state === 'active' ? 'on' : '')}>{item.state === 'active' ? item.archived_in_keitaro ? 'Будет восстановлен' : 'Активен' : item.archived_in_keitaro ? 'Удалён в Keitaro' : 'Удалён'}</span>
                 <div className="offer-actions">
                   {item.state === 'active' && <button className={'pin-action ' + (item.locked ? 'pinned' : '')} aria-pressed={!!item.locked} title={item.locked ? `Закреплено ${item.locked_share}% — нажмите, чтобы открепить` : 'Закрепить текущий вес'} disabled={busy} onClick={() => stageChange(stream.id, item.offer_id, 'lock')}>{item.locked ? '🔒 Закреплено' : '🔓 Закрепить'}</button>}
                   <button className="row-action" disabled={busy} onClick={() => stageChange(stream.id, item.offer_id, item.state === 'active' ? 'remove' : 'restore')}>{item.state === 'active' ? 'Удалить' : 'Восстановить'}</button>

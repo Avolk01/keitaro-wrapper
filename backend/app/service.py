@@ -45,7 +45,9 @@ async def campaign_details(client, campaign_id: int) -> dict:
 
 
 async def prepare_offer_draft(client, campaign_id: int, stream_id: int, offers: list[dict],
-                              expected_updated_at: str | None) -> tuple[list[dict], dict[int, int]]:
+                              expected_updated_at: str | None,
+                              archived_ids: set[int] | None = None) -> tuple[list[dict], dict[int, int]]:
+    archived_ids = archived_ids or set()
     streams = await client.get(f"campaigns/{campaign_id}/streams")
     stream = next((s for s in streams if s["id"] == stream_id), None)
     if not stream:
@@ -61,19 +63,25 @@ async def prepare_offer_draft(client, campaign_id: int, stream_id: int, offers: 
     if not existing_ids.issubset(submitted_ids):
         raise HTTPException(422, "Черновик должен содержать все существующие офферы потока")
     for offer in offers:
-        if offer["offer_id"] not in existing_ids:
-            if offer["state"] != "active":
-                raise HTTPException(422, "Новый оффер должен быть активным")
+        if offer["offer_id"] not in existing_ids and offer["state"] == "active":
+            if offer["offer_id"] in archived_ids:
+                continue
             existing_offer = await client.get(f"offers/{offer['offer_id']}")
             if existing_offer.get("state") != "active":
                 raise HTTPException(422, f"Оффер #{offer['offer_id']} недоступен")
     locked_shares = {offer["offer_id"]: offer["locked_share"] for offer in offers if offer["state"] == "active" and offer["locked"]}
     if any(value is None for value in locked_shares.values()):
         raise HTTPException(422, "Для закреплённого оффера нужна доля")
-    payload = [{"offer_id": offer["offer_id"], "state": offer["state"], "share": offer["share"]} for offer in offers]
+    # Missing rows are remembered locally for the editor, not sent back to Keitaro
+    # until the user restores them. Archived offers cannot be included as disabled.
+    payload = [
+        {"offer_id": offer["offer_id"], "state": offer["state"], "share": offer["share"]}
+        for offer in offers
+        if offer["state"] == "active" or (offer["offer_id"] in existing_ids and offer["offer_id"] not in archived_ids)
+    ]
     original = {offer["offer_id"]: offer for offer in stream.get("offers", [])}
-    same_membership = set(submitted_ids) == set(original) and all(
-        offer["state"] == original[offer["offer_id"]]["state"] for offer in offers
+    same_membership = {offer["offer_id"] for offer in payload} == set(original) and all(
+        offer["state"] == original[offer["offer_id"]]["state"] for offer in payload
     )
     if same_membership:
         for offer in payload:

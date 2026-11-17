@@ -32,5 +32,15 @@ class OfferWeightLock(Base):
     share: Mapped[int] = mapped_column(Integer)
 
 
+class StreamOfferSnapshot(Base):
+    __tablename__ = "stream_offer_snapshot"
+    __table_args__ = (UniqueConstraint("stream_id", "offer_id", name="uq_stream_offer_snapshot_stream_offer"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    campaign_id: Mapped[int] = mapped_column(Integer, index=True)
+    stream_id: Mapped[int] = mapped_column(Integer)
+    offer_id: Mapped[int] = mapped_column(Integer)
+
+
 engine = create_engine(settings.database_url, connect_args={"check_same_thread": False} if settings.database_url.startswith("sqlite") else {})
 SessionLocal = sessionmaker(bind=engine)
