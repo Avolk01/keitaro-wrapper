@@ -15,12 +15,22 @@ def validate_geo(geo: str) -> str:
     return geo
 
 
-def distribute(offers: list[dict]) -> list[dict]:
-    """Assign whole percentage points without losing or creating traffic."""
+def distribute(offers: list[dict], locked_shares: dict[int, int] | None = None) -> list[dict]:
+    """Keep locked shares and divide the remaining whole percentage points."""
+    locked_shares = locked_shares or {}
     active = [o for o in offers if o.get("state", "active") == "active"]
-    if active:
-        q, rem = divmod(100, len(active))
-        for i, offer in enumerate(active):
+    locked = [o for o in active if o["offer_id"] in locked_shares]
+    unlocked = [o for o in active if o["offer_id"] not in locked_shares]
+    locked_total = sum(locked_shares[o["offer_id"]] for o in locked)
+    if locked_total > 100:
+        raise HTTPException(409, "Сумма закреплённых долей превышает 100%")
+    if active and not unlocked and locked_total != 100:
+        raise HTTPException(409, "Нельзя изменить поток: для остатка трафика нет незакреплённого оффера")
+    for offer in locked:
+        offer["share"] = locked_shares[offer["offer_id"]]
+    if unlocked:
+        q, rem = divmod(100 - locked_total, len(unlocked))
+        for i, offer in enumerate(unlocked):
             offer["share"] = q + (1 if i < rem else 0)
     for offer in offers:
         if offer.get("state") != "active":
@@ -41,7 +51,8 @@ async def campaign_details(client, campaign_id: int) -> dict:
     return {"campaign": campaign, "streams": streams}
 
 
-async def update_offer(client, campaign_id: int, stream_id: int, offer_id: int, action: str) -> dict:
+async def update_offer(client, campaign_id: int, stream_id: int, offer_id: int, action: str,
+                       locked_shares: dict[int, int] | None = None) -> dict:
     streams = await client.get(f"campaigns/{campaign_id}/streams")
     stream = next((s for s in streams if s["id"] == stream_id), None)
     if not stream:
@@ -64,7 +75,7 @@ async def update_offer(client, campaign_id: int, stream_id: int, offer_id: int, 
         current["state"] = "disabled"
     else:
         raise ValueError(action)
-    await client.put(f"streams/{stream_id}", {"offers": distribute(offers)})
+    await client.put(f"streams/{stream_id}", {"offers": distribute(offers, locked_shares)})
     return await campaign_details(client, campaign_id)
 
 

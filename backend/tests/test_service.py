@@ -4,8 +4,12 @@ from unittest.mock import patch
 
 import httpx
 from fastapi import HTTPException
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
 
 from app.main import app
+from app.db import Base
 from app.service import create_campaign, distribute, update_offer
 
 
@@ -16,6 +20,12 @@ class FakeKeitaro:
             {"offer_id": 2, "state": "active", "share": 50},
         ]}
         self.writes = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        pass
 
     async def get(self, path, **kwargs):
         if path == "campaigns/7/streams":
@@ -42,6 +52,32 @@ class FakeKeitaro:
 
 
 class ServiceTest(unittest.TestCase):
+    def test_lock_endpoint_persists_and_unlocks(self):
+        engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+        Base.metadata.create_all(engine)
+        sessions = sessionmaker(bind=engine)
+        tracker = FakeKeitaro()
+
+        async def exercise():
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+                path = "/api/campaigns/7/streams/11/offers/1/lock"
+                locked = await client.put(path)
+                refreshed = await client.get("/api/campaigns/7")
+                added = await client.post("/api/campaigns/7/streams/11/offers", json={"offer_id": 3})
+                removed = await client.delete("/api/campaigns/7/streams/11/offers/2")
+                unlocked = await client.delete(path)
+                return locked, refreshed, added, removed, unlocked
+
+        with patch("app.main.Keitaro", lambda: tracker), patch("app.main.SessionLocal", sessions):
+            locked, refreshed, added, removed, unlocked = asyncio.run(exercise())
+        self.assertEqual([locked.status_code, refreshed.status_code, added.status_code, removed.status_code, unlocked.status_code], [200] * 5)
+        self.assertTrue(locked.json()["streams"][0]["offers"][0]["locked"])
+        self.assertEqual(refreshed.json()["streams"][0]["offers"][0]["locked_share"], 50)
+        self.assertEqual([o["share"] for o in added.json()["streams"][0]["offers"]], [50, 25, 25])
+        self.assertEqual([o["share"] for o in removed.json()["streams"][0]["offers"]], [50, 0, 50])
+        self.assertFalse(unlocked.json()["streams"][0]["offers"][0]["locked"])
+        engine.dispose()
+
     def test_options_load_with_required_group_type(self):
         class OptionsKeitaro:
             async def __aenter__(self):
@@ -70,6 +106,20 @@ class ServiceTest(unittest.TestCase):
     def test_distribute_exactly_100(self):
         result = distribute([{"offer_id": n, "state": "active"} for n in range(3)])
         self.assertEqual([o["share"] for o in result], [34, 33, 33])
+
+    def test_locked_share_survives_addition_and_removal(self):
+        client = FakeKeitaro()
+        asyncio.run(update_offer(client, 7, 11, 3, "add", {1: 50}))
+        self.assertEqual([o["share"] for o in client.stream["offers"]], [50, 25, 25])
+        asyncio.run(update_offer(client, 7, 11, 2, "remove", {1: 50}))
+        self.assertEqual([o["share"] for o in client.stream["offers"]], [50, 0, 50])
+
+    def test_rejects_removal_without_unlocked_offer_for_remainder(self):
+        client = FakeKeitaro()
+        with self.assertRaises(HTTPException) as raised:
+            asyncio.run(update_offer(client, 7, 11, 2, "remove", {1: 50}))
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertEqual(client.writes, [])
 
     def test_remove_then_restore(self):
         client = FakeKeitaro()
