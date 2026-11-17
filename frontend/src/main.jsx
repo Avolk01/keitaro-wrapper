@@ -51,8 +51,7 @@ function App() {
   const offerName = id => [...options.offers, ...options.deleted_offers].find(offer => offer.id === id)?.name || `Оффер #${id}`
   const setField = (key, value) => setForm(previous => ({ ...previous, [key]: value }))
 
-  const load = async (interactive = false) => {
-    if (interactive) { setBusy(true); setError(''); setNotice('') }
+  const load = async () => {
     const requests = [api('/options'), api('/campaigns'), selected && !hasChanges ? api('/campaigns/' + selected) : Promise.resolve(null)]
     const [optionResult, campaignResult, detailResult] = await Promise.allSettled(requests)
     if (optionResult.status === 'fulfilled') setOptions(optionResult.value)
@@ -63,10 +62,7 @@ function App() {
     }
     const failures = [optionResult, campaignResult, detailResult].filter(result => result.status === 'rejected')
     setError(failures.map(result => result.reason.message).join('; '))
-    if (interactive && !failures.length) setNotice(hasChanges
-      ? 'Справочники обновлены. Несохранённые изменения оставлены в черновике.'
-      : 'Информация об офферах и кампаниях обновлена')
-    if (interactive) setBusy(false)
+    if (selected && hasChanges && !failures.length) setNotice('Справочники обновлены. Несохранённые изменения оставлены в черновике.')
   }
   useEffect(() => { load() }, [])
 
@@ -118,6 +114,22 @@ function App() {
     setError(''); setNotice('Черновик отменён')
   }
 
+  const refreshOffers = async () => {
+    if (!selected) return
+    setBusy(true); setError(''); setNotice('')
+    try {
+      const opts = await api('/options')
+      setOptions(opts)
+      if (hasChanges) {
+        setNotice('Справочник офферов обновлён. Черновик сохранён без изменений.')
+      } else {
+        const current = await api('/campaigns/' + selected)
+        setDetails(current); setDraftStreams(cloneStreams(current.streams))
+        setNotice('Информация об офферах обновлена')
+      }
+    } catch (err) { setError(err.message) } finally { setBusy(false) }
+  }
+
   const sendChanges = async () => {
     if (!hasChanges) return
     setBusy(true); setError(''); setNotice('')
@@ -167,7 +179,7 @@ function App() {
         <div className="eyebrow">KEITARO / {tab === 'create' ? 'НОВАЯ КАМПАНИЯ' : 'РЕДАКТОР'}</div>
         <h1>{tab === 'create' ? 'Создать кампанию' : 'Редактор кампании'}</h1>
         <p>{tab === 'create' ? 'Настройте маршрут трафика за один шаг.' : 'Изменения отправятся в Keitaro после подтверждения.'}</p>
-      </div><button className="refresh" disabled={busy} onClick={() => load(true)} title="Обновить офферы и кампании">↻ <span>Обновить офферы</span></button></header>
+      </div><button className="refresh" onClick={load}>↻ <span>Обновить данные</span></button></header>
       {error && <div className="alert error">{error}<button onClick={() => setError('')}>×</button></div>}
       {notice && <div className="alert success">{notice}<button onClick={() => setNotice('')}>×</button></div>}
 
@@ -210,7 +222,7 @@ function App() {
         </section>
         {details && <>
           <div className="campaign-title"><div><div className="eyebrow">КАМПАНИЯ #{details.campaign.id}</div><h2>{details.campaign.name}</h2></div>
-            <a href={`https://tlgk.host/admin/#!/campaign/${details.campaign.id}/main`} target="_blank" rel="noreferrer">Открыть в Keitaro ↗</a>
+            <div className="campaign-tools"><button className="secondary refresh-offers" disabled={busy} onClick={refreshOffers}>↻ Обновить офферы</button><a href={`https://tlgk.host/admin/#!/campaign/${details.campaign.id}/main`} target="_blank" rel="noreferrer">Открыть в Keitaro ↗</a></div>
           </div>
           <div className={'draft-banner ' + (hasChanges ? 'dirty' : '')}>
             <div><b>{hasChanges ? 'Есть несохранённые изменения' : 'Все изменения сохранены'}</b><span>{hasChanges ? `Изменено потоков: ${changedIds.length}. Keitaro пока не обновлён.` : 'Данные синхронизированы с Keitaro.'}</span></div>
