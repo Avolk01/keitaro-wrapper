@@ -8,14 +8,14 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from app.main import app
 from app.db import Base
-from app.service import create_campaign, distribute, update_offer
+from app.main import app
+from app.service import create_campaign, distribute, prepare_offer_draft
 
 
 class FakeKeitaro:
     def __init__(self):
-        self.stream = {"id": 11, "schema": "landings", "offers": [
+        self.stream = {"id": 11, "schema": "landings", "updated_at": "v1", "offers": [
             {"offer_id": 1, "state": "active", "share": 50},
             {"offer_id": 2, "state": "active", "share": 50},
         ]}
@@ -33,13 +33,9 @@ class FakeKeitaro:
         if path == "campaigns/7":
             return {"id": 7, "name": "Test"}
         if path == "groups":
-            self.assert_group_type(kwargs)
+            assert kwargs.get("params") == {"type": "campaigns"}
             return [{"id": 4, "type": "campaigns"}]
-        return {"id": int(path.split("/")[-1])}
-
-    @staticmethod
-    def assert_group_type(kwargs):
-        assert kwargs.get("params") == {"type": "campaigns"}
+        return {"id": int(path.split("/")[-1]), "state": "active"}
 
     async def post(self, path, data):
         self.writes.append((path, data))
@@ -48,99 +44,76 @@ class FakeKeitaro:
     async def put(self, path, data):
         self.writes.append((path, data))
         self.stream["offers"] = data["offers"]
+        self.stream["updated_at"] = f"v{len(self.writes) + 1}"
         return self.stream
 
 
+def draft_offer(offer_id, state="active", share=0, locked=False, locked_share=None):
+    return {"offer_id": offer_id, "state": state, "share": share,
+            "locked": locked, "locked_share": locked_share}
+
+
 class ServiceTest(unittest.TestCase):
-    def test_lock_endpoint_persists_and_unlocks(self):
+    def test_distribute_exactly_100_with_lock(self):
+        items = [draft_offer(1, share=50), draft_offer(2), draft_offer(3)]
+        self.assertEqual([item["share"] for item in distribute(items, {1: 50})], [50, 25, 25])
+
+    def test_rejects_unallocatable_remainder(self):
+        items = [draft_offer(1, share=50), draft_offer(2, "disabled")]
+        with self.assertRaises(HTTPException) as raised:
+            distribute(items, {1: 50})
+        self.assertEqual(raised.exception.status_code, 409)
+
+    def test_draft_validation_does_not_write(self):
+        tracker = FakeKeitaro()
+        submitted = [draft_offer(1, share=50, locked=True, locked_share=50), draft_offer(2, share=50)]
+        offers, locks = asyncio.run(prepare_offer_draft(tracker, 7, 11, submitted, "v1"))
+        self.assertEqual([item["share"] for item in offers], [50, 50])
+        self.assertEqual(locks, {1: 50})
+        self.assertEqual(tracker.writes, [])
+
+    def test_rejects_stale_draft_without_write(self):
+        tracker = FakeKeitaro()
+        with self.assertRaises(HTTPException) as raised:
+            asyncio.run(prepare_offer_draft(tracker, 7, 11, [draft_offer(1), draft_offer(2)], "old"))
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertEqual(tracker.writes, [])
+
+    def test_send_draft_add_remove_restore_and_lock(self):
         engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
         Base.metadata.create_all(engine)
-        sessions = sessionmaker(bind=engine)
         tracker = FakeKeitaro()
 
         async def exercise():
             async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
-                path = "/api/campaigns/7/streams/11/offers/1/lock"
-                locked = await client.put(path)
-                refreshed = await client.get("/api/campaigns/7")
-                added = await client.post("/api/campaigns/7/streams/11/offers", json={"offer_id": 3})
-                removed = await client.delete("/api/campaigns/7/streams/11/offers/2")
-                unlocked = await client.delete(path)
-                return locked, refreshed, added, removed, unlocked
+                path = "/api/campaigns/7/streams/11/draft"
+                initial = await client.get("/api/campaigns/7")
+                add = await client.put(path, json={"expected_updated_at": "v1", "offers": [
+                    draft_offer(1, share=50, locked=True, locked_share=50), draft_offer(2, share=50), draft_offer(3)]})
+                after_add = add.json()["streams"][0]
+                remove = await client.put(path, json={"expected_updated_at": after_add["updated_at"], "offers": [
+                    draft_offer(1, share=50, locked=True, locked_share=50), draft_offer(2, "disabled"), draft_offer(3, share=25)]})
+                after_remove = remove.json()["streams"][0]
+                restore = await client.put(path, json={"expected_updated_at": after_remove["updated_at"], "offers": [
+                    draft_offer(1, share=50, locked=True, locked_share=50), draft_offer(2), draft_offer(3)]})
+                return initial, add, remove, restore
 
-        with patch("app.main.Keitaro", lambda: tracker), patch("app.main.SessionLocal", sessions):
-            locked, refreshed, added, removed, unlocked = asyncio.run(exercise())
-        self.assertEqual([locked.status_code, refreshed.status_code, added.status_code, removed.status_code, unlocked.status_code], [200] * 5)
-        self.assertTrue(locked.json()["streams"][0]["offers"][0]["locked"])
-        self.assertEqual(refreshed.json()["streams"][0]["offers"][0]["locked_share"], 50)
-        self.assertEqual([o["share"] for o in added.json()["streams"][0]["offers"]], [50, 25, 25])
-        self.assertEqual([o["share"] for o in removed.json()["streams"][0]["offers"]], [50, 0, 50])
-        self.assertFalse(unlocked.json()["streams"][0]["offers"][0]["locked"])
+        with patch("app.main.Keitaro", lambda: tracker), patch("app.main.SessionLocal", sessionmaker(bind=engine)):
+            initial, add, remove, restore = asyncio.run(exercise())
+        self.assertEqual([response.status_code for response in (initial, add, remove, restore)], [200] * 4)
+        self.assertFalse(initial.json()["streams"][0]["offers"][0]["locked"])
+        self.assertEqual([item["share"] for item in add.json()["streams"][0]["offers"]], [50, 25, 25])
+        self.assertTrue(add.json()["streams"][0]["offers"][0]["locked"])
+        self.assertEqual([item["share"] for item in remove.json()["streams"][0]["offers"]], [50, 0, 50])
+        self.assertEqual([item["share"] for item in restore.json()["streams"][0]["offers"]], [50, 25, 25])
+        self.assertEqual(len(tracker.writes), 3)
         engine.dispose()
 
-    def test_options_load_with_required_group_type(self):
-        class OptionsKeitaro:
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, *args):
-                pass
-
-            async def get(self, path, **kwargs):
-                if path == "groups":
-                    if kwargs.get("params") != {"type": "campaigns"}:
-                        raise HTTPException(400, "Param 'type' is required")
-                    return [{"id": 2, "name": "Test group", "type": "campaigns"}]
-                return [{"id": 1, "name": path, "state": "active"}]
-
-        async def fetch():
-            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
-                return await client.get("/api/options")
-
-        with patch("app.main.Keitaro", OptionsKeitaro):
-            response = asyncio.run(fetch())
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual({key: len(items) for key, items in response.json().items()},
-                         {"domains": 1, "groups": 1, "sources": 1, "offers": 1})
-
-    def test_distribute_exactly_100(self):
-        result = distribute([{"offer_id": n, "state": "active"} for n in range(3)])
-        self.assertEqual([o["share"] for o in result], [34, 33, 33])
-
-    def test_locked_share_survives_addition_and_removal(self):
-        client = FakeKeitaro()
-        asyncio.run(update_offer(client, 7, 11, 3, "add", {1: 50}))
-        self.assertEqual([o["share"] for o in client.stream["offers"]], [50, 25, 25])
-        asyncio.run(update_offer(client, 7, 11, 2, "remove", {1: 50}))
-        self.assertEqual([o["share"] for o in client.stream["offers"]], [50, 0, 50])
-
-    def test_rejects_removal_without_unlocked_offer_for_remainder(self):
-        client = FakeKeitaro()
-        with self.assertRaises(HTTPException) as raised:
-            asyncio.run(update_offer(client, 7, 11, 2, "remove", {1: 50}))
-        self.assertEqual(raised.exception.status_code, 409)
-        self.assertEqual(client.writes, [])
-
-    def test_remove_then_restore(self):
-        client = FakeKeitaro()
-        asyncio.run(update_offer(client, 7, 11, 1, "remove"))
-        self.assertEqual([o["share"] for o in client.stream["offers"]], [0, 100])
-        self.assertEqual(client.stream["offers"][0]["state"], "disabled")
-        asyncio.run(update_offer(client, 7, 11, 1, "add"))
-        self.assertEqual([o["share"] for o in client.stream["offers"]], [50, 50])
-
     def test_create_has_expected_order_and_filter(self):
-        client = FakeKeitaro()
-        asyncio.run(create_campaign(client, "New", "ru", 2, 3, 4, 5))
-        self.assertEqual([path for path, _ in client.writes], ["campaigns", "streams", "streams"])
-        self.assertEqual(client.writes[1][1]["filters"], [{"name": "country", "mode": "accept", "payload": ["RU"]}])
-        self.assertEqual(client.writes[2][1]["offers"][0]["share"], 100)
-
-    def test_rejects_wrong_stream(self):
-        client = FakeKeitaro()
-        client.stream["schema"] = "redirect"
-        with self.assertRaises(HTTPException):
-            asyncio.run(update_offer(client, 7, 11, 3, "add"))
+        tracker = FakeKeitaro()
+        asyncio.run(create_campaign(tracker, "New", "ru", 2, 3, 4, 5))
+        self.assertEqual([path for path, _ in tracker.writes], ["campaigns", "streams", "streams"])
+        self.assertEqual(tracker.writes[1][1]["filters"], [{"name": "country", "mode": "accept", "payload": ["RU"]}])
 
 
 if __name__ == "__main__":

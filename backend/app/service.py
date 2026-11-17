@@ -38,45 +38,50 @@ def distribute(offers: list[dict], locked_shares: dict[int, int] | None = None) 
     return offers
 
 
-def offers_for_update(stream: dict) -> list[dict]:
-    return [
-        {"offer_id": item["offer_id"], "state": item.get("state", "active"), "share": item.get("share", 0)}
-        for item in stream.get("offers", [])
-    ]
-
-
 async def campaign_details(client, campaign_id: int) -> dict:
     campaign = await client.get(f"campaigns/{campaign_id}")
     streams = await client.get(f"campaigns/{campaign_id}/streams")
     return {"campaign": campaign, "streams": streams}
 
 
-async def update_offer(client, campaign_id: int, stream_id: int, offer_id: int, action: str,
-                       locked_shares: dict[int, int] | None = None) -> dict:
+async def prepare_offer_draft(client, campaign_id: int, stream_id: int, offers: list[dict],
+                              expected_updated_at: str | None) -> tuple[list[dict], dict[int, int]]:
     streams = await client.get(f"campaigns/{campaign_id}/streams")
     stream = next((s for s in streams if s["id"] == stream_id), None)
     if not stream:
         raise HTTPException(404, "Поток не найден в кампании")
     if stream.get("schema") != "landings":
         raise HTTPException(422, "Офферы можно менять только в потоке лендингов и офферов")
-    offers = offers_for_update(stream)
-    current = next((o for o in offers if o["offer_id"] == offer_id), None)
-    if action == "add":
-        if current and current["state"] == "active":
-            raise HTTPException(409, "Оффер уже добавлен")
-        if current:
-            current["state"] = "active"
-        else:
-            await client.get(f"offers/{offer_id}")
-            offers.append({"offer_id": offer_id, "state": "active", "share": 0})
-    elif action == "remove":
-        if not current or current["state"] != "active":
-            raise HTTPException(404, "Активный оффер не найден")
-        current["state"] = "disabled"
-    else:
-        raise ValueError(action)
-    await client.put(f"streams/{stream_id}", {"offers": distribute(offers, locked_shares)})
-    return await campaign_details(client, campaign_id)
+    if expected_updated_at and stream.get("updated_at") != expected_updated_at:
+        raise HTTPException(409, "Поток изменился в Keitaro. Обновите данные перед отправкой")
+    submitted_ids = [offer["offer_id"] for offer in offers]
+    if len(submitted_ids) != len(set(submitted_ids)):
+        raise HTTPException(422, "Оффер указан в потоке несколько раз")
+    existing_ids = {offer["offer_id"] for offer in stream.get("offers", [])}
+    if not existing_ids.issubset(submitted_ids):
+        raise HTTPException(422, "Черновик должен содержать все существующие офферы потока")
+    for offer in offers:
+        if offer["offer_id"] not in existing_ids:
+            if offer["state"] != "active":
+                raise HTTPException(422, "Новый оффер должен быть активным")
+            existing_offer = await client.get(f"offers/{offer['offer_id']}")
+            if existing_offer.get("state") != "active":
+                raise HTTPException(422, f"Оффер #{offer['offer_id']} недоступен")
+    locked_shares = {offer["offer_id"]: offer["locked_share"] for offer in offers if offer["state"] == "active" and offer["locked"]}
+    if any(value is None for value in locked_shares.values()):
+        raise HTTPException(422, "Для закреплённого оффера нужна доля")
+    payload = [{"offer_id": offer["offer_id"], "state": offer["state"], "share": offer["share"]} for offer in offers]
+    original = {offer["offer_id"]: offer for offer in stream.get("offers", [])}
+    same_membership = set(submitted_ids) == set(original) and all(
+        offer["state"] == original[offer["offer_id"]]["state"] for offer in offers
+    )
+    if same_membership:
+        for offer in payload:
+            offer["share"] = original[offer["offer_id"]]["share"]
+        if any(offer["share"] != locked_shares[offer["offer_id"]] for offer in payload if offer["offer_id"] in locked_shares):
+            raise HTTPException(422, "Закреплённая доля должна совпадать с текущей долей оффера")
+        return payload, locked_shares
+    return distribute(payload, locked_shares), locked_shares
 
 
 async def create_campaign(client, name: str, geo: str, offer_id: int, domain_id: int, group_id: int, source_id: int) -> dict:

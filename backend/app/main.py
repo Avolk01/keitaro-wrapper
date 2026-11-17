@@ -1,4 +1,5 @@
 from contextlib import asynccontextmanager
+from typing import Literal
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -8,7 +9,7 @@ from sqlalchemy import delete, select
 from .config import settings
 from .db import ChangeLog, OfferWeightLock, SessionLocal
 from .keitaro import Keitaro
-from .service import campaign_details, create_campaign, update_offer
+from .service import campaign_details, create_campaign, prepare_offer_draft
 
 
 @asynccontextmanager
@@ -29,8 +30,17 @@ class CampaignInput(BaseModel):
     source_id: int = Field(gt=0)
 
 
-class OfferInput(BaseModel):
+class DraftOffer(BaseModel):
     offer_id: int = Field(gt=0)
+    state: Literal["active", "disabled"]
+    share: int = Field(ge=0, le=100)
+    locked: bool = False
+    locked_share: int | None = Field(default=None, ge=0, le=100)
+
+
+class StreamDraft(BaseModel):
+    expected_updated_at: str | None = None
+    offers: list[DraftOffer]
 
 
 def log_change(campaign_id: int, stream_id: int | None, action: str, offer_id: int | None):
@@ -100,59 +110,23 @@ async def details(campaign_id: int):
         return enrich_details(await campaign_details(client, campaign_id))
 
 
-@app.post("/api/campaigns/{campaign_id}/streams/{stream_id}/offers")
-async def add_offer(campaign_id: int, stream_id: int, data: OfferInput):
-    locks = {offer_id: share for (sid, offer_id), share in load_locks(campaign_id, stream_id).items() if sid == stream_id}
+@app.put("/api/campaigns/{campaign_id}/streams/{stream_id}/draft")
+async def send_draft(campaign_id: int, stream_id: int, data: StreamDraft):
     async with Keitaro() as client:
-        result = await update_offer(client, campaign_id, stream_id, data.offer_id, "add", locks)
-    log_change(campaign_id, stream_id, "add", data.offer_id)
-    return enrich_details(result)
-
-
-@app.delete("/api/campaigns/{campaign_id}/streams/{stream_id}/offers/{offer_id}")
-async def remove_offer(campaign_id: int, stream_id: int, offer_id: int):
-    locks = {oid: share for (sid, oid), share in load_locks(campaign_id, stream_id).items() if sid == stream_id}
-    async with Keitaro() as client:
-        result = await update_offer(client, campaign_id, stream_id, offer_id, "remove", locks)
+        offers, locked_shares = await prepare_offer_draft(
+            client, campaign_id, stream_id, [offer.model_dump() for offer in data.offers], data.expected_updated_at
+        )
+        await client.put(f"streams/{stream_id}", {"offers": offers})
     with SessionLocal() as db:
-        db.execute(delete(OfferWeightLock).where(OfferWeightLock.stream_id == stream_id, OfferWeightLock.offer_id == offer_id))
+        db.execute(delete(OfferWeightLock).where(OfferWeightLock.campaign_id == campaign_id, OfferWeightLock.stream_id == stream_id))
+        db.add_all(
+            OfferWeightLock(campaign_id=campaign_id, stream_id=stream_id, offer_id=offer_id, share=share)
+            for offer_id, share in locked_shares.items()
+        )
         db.commit()
-    log_change(campaign_id, stream_id, "remove", offer_id)
-    return enrich_details(result)
-
-
-@app.put("/api/campaigns/{campaign_id}/streams/{stream_id}/offers/{offer_id}/lock")
-async def lock_offer(campaign_id: int, stream_id: int, offer_id: int):
+    log_change(campaign_id, stream_id, "save_draft", None)
     async with Keitaro() as client:
-        result = await campaign_details(client, campaign_id)
-    stream = next((item for item in result["streams"] if item["id"] == stream_id), None)
-    if not stream or stream.get("schema") != "landings":
-        raise HTTPException(404, "Поток офферов не найден в кампании")
-    offer = next((item for item in stream.get("offers", []) if item["offer_id"] == offer_id and item.get("state") == "active"), None)
-    if not offer:
-        raise HTTPException(404, "Активный оффер не найден в потоке")
-    with SessionLocal() as db:
-        existing = db.scalar(select(OfferWeightLock).where(OfferWeightLock.stream_id == stream_id, OfferWeightLock.offer_id == offer_id))
-        if existing:
-            raise HTTPException(409, "Вес оффера уже закреплён")
-        db.add(OfferWeightLock(campaign_id=campaign_id, stream_id=stream_id, offer_id=offer_id, share=offer["share"]))
-        db.commit()
-    log_change(campaign_id, stream_id, "lock", offer_id)
-    return enrich_details(result)
-
-
-@app.delete("/api/campaigns/{campaign_id}/streams/{stream_id}/offers/{offer_id}/lock")
-async def unlock_offer(campaign_id: int, stream_id: int, offer_id: int):
-    async with Keitaro() as client:
-        result = await campaign_details(client, campaign_id)
-    with SessionLocal() as db:
-        lock = db.scalar(select(OfferWeightLock).where(OfferWeightLock.campaign_id == campaign_id, OfferWeightLock.stream_id == stream_id, OfferWeightLock.offer_id == offer_id))
-        if not lock:
-            raise HTTPException(404, "Закрепление не найдено")
-        db.delete(lock)
-        db.commit()
-    log_change(campaign_id, stream_id, "unlock", offer_id)
-    return enrich_details(result)
+        return enrich_details(await campaign_details(client, campaign_id))
 
 
 @app.get("/api/campaigns/{campaign_id}/history")
