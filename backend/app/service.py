@@ -74,7 +74,7 @@ async def create_campaign(client, name: str, geo: str, offer_id: int, domain_id:
     await client.get(f"offers/{offer_id}")
     await client.get(f"domains/{domain_id}")
     await client.get(f"traffic_sources/{source_id}")
-    groups = await client.get("groups")
+    groups = await client.get("groups", params={"type": "campaigns"})
     if not any(g["id"] == group_id and g.get("type") == "campaigns" for g in groups):
         raise HTTPException(422, "Выберите группу кампаний")
     campaign = await client.post("campaigns", {

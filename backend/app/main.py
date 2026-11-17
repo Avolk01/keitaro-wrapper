@@ -48,7 +48,7 @@ def health():
 async def options():
     async with Keitaro() as client:
         domains = await client.get("domains")
-        groups = await client.get("groups")
+        groups = await client.get("groups", params={"type": "campaigns"})
         sources = await client.get("traffic_sources")
         offers = await client.get("offers")
     return {

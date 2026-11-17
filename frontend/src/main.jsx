@@ -29,10 +29,11 @@ function App() {
   const [query, setQuery] = useState('')
 
   const load = async () => {
-    try {
-      const [opts, list] = await Promise.all([api('/options'), api('/campaigns')])
-      setOptions(opts); setCampaigns(list)
-    } catch (err) { setError(err.message) }
+    const [optionResult, campaignResult] = await Promise.allSettled([api('/options'), api('/campaigns')])
+    if (optionResult.status === 'fulfilled') setOptions(optionResult.value)
+    if (campaignResult.status === 'fulfilled') setCampaigns(campaignResult.value)
+    const failures = [optionResult, campaignResult].filter(result => result.status === 'rejected')
+    setError(failures.map(result => result.reason.message).join('; '))
   }
   useEffect(() => { load() }, [])
   const setField = (key, value) => setForm(prev => ({ ...prev, [key]: value }))

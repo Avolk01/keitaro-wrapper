@@ -1,8 +1,11 @@
 import asyncio
 import unittest
+from unittest.mock import patch
 
+import httpx
 from fastapi import HTTPException
 
+from app.main import app
 from app.service import create_campaign, distribute, update_offer
 
 
@@ -14,14 +17,19 @@ class FakeKeitaro:
         ]}
         self.writes = []
 
-    async def get(self, path):
+    async def get(self, path, **kwargs):
         if path == "campaigns/7/streams":
             return [self.stream]
         if path == "campaigns/7":
             return {"id": 7, "name": "Test"}
         if path == "groups":
+            self.assert_group_type(kwargs)
             return [{"id": 4, "type": "campaigns"}]
         return {"id": int(path.split("/")[-1])}
+
+    @staticmethod
+    def assert_group_type(kwargs):
+        assert kwargs.get("params") == {"type": "campaigns"}
 
     async def post(self, path, data):
         self.writes.append((path, data))
@@ -34,6 +42,31 @@ class FakeKeitaro:
 
 
 class ServiceTest(unittest.TestCase):
+    def test_options_load_with_required_group_type(self):
+        class OptionsKeitaro:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                pass
+
+            async def get(self, path, **kwargs):
+                if path == "groups":
+                    if kwargs.get("params") != {"type": "campaigns"}:
+                        raise HTTPException(400, "Param 'type' is required")
+                    return [{"id": 2, "name": "Test group", "type": "campaigns"}]
+                return [{"id": 1, "name": path, "state": "active"}]
+
+        async def fetch():
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+                return await client.get("/api/options")
+
+        with patch("app.main.Keitaro", OptionsKeitaro):
+            response = asyncio.run(fetch())
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual({key: len(items) for key, items in response.json().items()},
+                         {"domains": 1, "groups": 1, "sources": 1, "offers": 1})
+
     def test_distribute_exactly_100(self):
         result = distribute([{"offer_id": n, "state": "active"} for n in range(3)])
         self.assertEqual([o["share"] for o in result], [34, 33, 33])
